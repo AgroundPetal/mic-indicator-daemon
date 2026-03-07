@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+
+import sys
+import subprocess
+from pydbus import SessionBus
+from gi.repository import GLib
+from pydbus.generic import signal
+
+BUS_NAME = "org.kde.StatusNotifierItem.mic"
+OBJ_PATH = "/StatusNotifierItem"
+EPS = sys.float_info.epsilon
+
+class Tray:
+    """
+    <node>
+      <interface name='org.kde.StatusNotifierItem'>
+        <property name='Category' type='s' access='read'/>
+        <property name='Id' type='s' access='read'/>
+        <property name='Title' type='s' access='read'/>
+        <property name='Status' type='s' access='read'/>
+        <property name='IconName' type='s' access='read'/>
+        <property name='ToolTip' type='(sa(iiay)ss)' access='read'/>
+
+        <method name='Activate'>
+          <arg type='i' name='x' direction='in'/>
+          <arg type='i' name='y' direction='in'/>
+        </method>
+
+        <signal name='NewIcon'/>
+      </interface>
+    </node>
+    """
+
+    Category = "SystemServices"
+    Id = "mic-indicator"
+    Title = "Microphone Indicator"
+    Status = "Active"
+    IconName = "microphone-sensitivity-muted"
+    ToolTip = ("", [], "Microphone", "Idle")
+
+    NewIcon = signal()
+
+    def Activate(self, x, y):
+        subprocess.run(
+            ["wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle"]
+        )
+
+
+tray = Tray()
+bus = SessionBus()
+
+bus.publish(BUS_NAME, (OBJ_PATH, tray))
+
+watcher = bus.get(
+    "org.kde.StatusNotifierWatcher",
+    "/StatusNotifierWatcher"
+)
+
+watcher.RegisterStatusNotifierItem(BUS_NAME)
+
+
+def mic_state():
+    volume = subprocess.run(
+        ["wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@"],
+        capture_output=True,
+        text=True
+    ).stdout
+
+    if "[MUTED]" in volume:
+        return "muted"
+
+    volume_v = float(volume.strip().split()[-1])
+
+    status = subprocess.run(
+        ["wpctl", "status"],
+        capture_output=True,
+        text=True
+    ).stdout
+
+    if "Audio/Source" in status:
+
+        if abs(volume_v) < 1e-9:
+            return "low"
+
+        return "active"
+
+
+    return "idle"
+
+
+current_icon = None
+
+
+def update():
+
+    global current_icon
+
+    state_icon = {
+        "active": "microphone-sensitivity-high",
+        "low": "microphone-sensitivity-low",
+        "muted": "microphone-sensitivity-muted",
+    }
+
+    state = mic_state()
+
+    icon = state_icon.get(
+        state,
+        "microphone-sensitivity-medium"
+        )
+
+
+    if icon != current_icon:
+        tray.IconName = icon
+        tray.NewIcon()
+        current_icon = icon
+
+    tray.ToolTip = ("", [], "Microphone", state)
+
+    return True
+
+
+GLib.timeout_add(500, update)
+GLib.MainLoop().run()
