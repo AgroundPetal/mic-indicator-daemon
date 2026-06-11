@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 
-import sys
+import json
+import re
 import subprocess
-from pydbus import SessionBus
+
 from gi.repository import GLib
+from pydbus import SessionBus
 from pydbus.generic import signal
 
 BUS_NAME = "org.kde.StatusNotifierItem.mic"
 OBJ_PATH = "/StatusNotifierItem"
-EPS = sys.float_info.epsilon
+PULSE_DEFAULT_SOURCE = "@DEFAULT_SOURCE@"
+WPCTL_DEFAULT_SOURCE = "@DEFAULT_AUDIO_SOURCE@"
+VOLUME_EPS = 1e-9
+
+VOLUME_RE = re.compile(r"Volume:\s*([0-9.]+)")
+PERCENT_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)%")
+SECTION_RE = re.compile(r"^[\s│]*[├└]─\s+(.+):\s*$")
+SOURCE_ID_RE = re.compile(r"^[\s│]*(?:\*\s*)?(\d+)\.")
+
 
 class Tray:
     """
@@ -35,79 +45,315 @@ class Tray:
     Id = "mic-indicator"
     Title = "Microphone Indicator"
     Status = "Active"
-    IconName = "microphone-sensitivity-muted"
-    ToolTip = ("", [], "Microphone", "Idle")
+    IconName = "microphone-sensitivity-medium"
+    ToolTip = ("", [], "Microphone", "Checking")
 
     NewIcon = signal()
 
     def Activate(self, x, y):
-        subprocess.run(
-            ["wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle"]
+        toggle_sources_mute()
+        update()
+
+
+# Command helpers
+
+def run_command(command):
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=2,
         )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+
+    return result.stdout
+
+
+def run_pactl(*args):
+    return run_command(["pactl", *args])
+
+
+def run_wpctl(*args):
+    return run_command(["wpctl", *args])
+
+
+# Source classification
+
+def source_state(sources):
+    if not sources:
+        return "unavailable"
+
+    unmuted_sources = [source for source in sources if not source["muted"]]
+    if not unmuted_sources:
+        return "muted"
+
+    if all(source["volume"] <= VOLUME_EPS for source in unmuted_sources):
+        return "zero-volume"
+
+    return "unmuted"
+
+
+# pactl backend: closer to what KDE/PipeWire Pulse clients see.
+
+def pactl_json_list(item_type):
+    output = run_pactl("--format=json", "list", item_type)
+    if not output:
+        return None
+
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError:
+        return None
+
+
+def pactl_muted(value):
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        return value.strip().lower() in {"yes", "true", "1"}
+
+    return False
+
+
+def pactl_volume_value(volume):
+    percents = []
+
+    if isinstance(volume, dict):
+        for channel in volume.values():
+            if isinstance(channel, dict):
+                percent = channel.get("value_percent") or channel.get("percent")
+                if isinstance(percent, str):
+                    percents.extend(float(match) for match in PERCENT_RE.findall(percent))
+                    continue
+
+                raw_value = channel.get("value")
+                if isinstance(raw_value, (int, float)):
+                    percents.append(float(raw_value) / 65536 * 100)
+            elif isinstance(channel, str):
+                percents.extend(float(match) for match in PERCENT_RE.findall(channel))
+    elif isinstance(volume, str):
+        percents.extend(float(match) for match in PERCENT_RE.findall(volume))
+
+    if not percents:
+        return 1.0
+
+    return max(percents) / 100
+
+
+def pactl_source_is_monitor(source):
+    name = str(source.get("name") or "")
+    description = str(source.get("description") or "")
+    monitor_of_sink = source.get("monitor_of_sink")
+
+    if monitor_of_sink not in {None, "", "n/a"}:
+        return True
+
+    return name.endswith(".monitor") or description.startswith("Monitor of ")
+
+
+def pactl_source_info(source):
+    if pactl_source_is_monitor(source):
+        return None
+
+    index = source.get("index")
+    name = source.get("name")
+    if index is None and not name:
+        return None
+
+    return {
+        "index": str(index) if index is not None else "",
+        "name": str(name or ""),
+        "target": str(name or index),
+        "muted": pactl_muted(source.get("mute")),
+        "volume": pactl_volume_value(source.get("volume")),
+        "state": str(source.get("state") or "").lower(),
+    }
+
+
+def pactl_sources():
+    sources_json = pactl_json_list("sources")
+    if sources_json is None:
+        return None
+
+    sources = []
+    for source in sources_json:
+        info = pactl_source_info(source)
+        if info:
+            sources.append(info)
+
+    return sources
+
+
+def pactl_default_source_name():
+    output = run_pactl("get-default-source")
+    return output.strip() if output else None
+
+
+def pactl_relevant_sources():
+    sources = pactl_sources()
+    if sources is None:
+        return None
+
+    if not sources:
+        return []
+
+    source_by_name = {source["name"]: source for source in sources if source["name"]}
+    default_name = pactl_default_source_name()
+    if default_name in source_by_name:
+        return [source_by_name[default_name]]
+
+    return sources
+
+
+def pactl_mic_state():
+    sources = pactl_relevant_sources()
+    if sources is None:
+        return None
+
+    return source_state(sources)
+
+
+def pactl_toggle_sources_mute():
+    sources = pactl_relevant_sources()
+    if sources is None:
+        return False
+
+    if not sources:
+        run_pactl("set-source-mute", PULSE_DEFAULT_SOURCE, "toggle")
+        return True
+
+    mute_sources = any(not source["muted"] for source in sources)
+    mute_value = "1" if mute_sources else "0"
+
+    for source in sources:
+        run_pactl("set-source-mute", source["target"], mute_value)
+
+    return True
+
+
+# wpctl fallback: keeps the daemon usable without PipeWire Pulse compatibility.
+
+def audio_section_lines(status):
+    in_audio = False
+
+    for line in status.splitlines():
+        section_name = line.strip()
+
+        if section_name == "Audio":
+            in_audio = True
+            continue
+
+        if in_audio and section_name in {"Video", "Settings"}:
+            break
+
+        if in_audio:
+            yield line
+
+
+def wpctl_source_ids_from_status(status):
+    source_ids = []
+    in_sources = False
+
+    for line in audio_section_lines(status):
+        section_match = SECTION_RE.match(line)
+        if section_match:
+            in_sources = section_match.group(1) == "Sources"
+            continue
+
+        if not in_sources:
+            continue
+
+        source_match = SOURCE_ID_RE.match(line)
+        if source_match:
+            source_ids.append(source_match.group(1))
+
+    return source_ids
+
+
+def wpctl_source_info(source_id):
+    volume = run_wpctl("get-volume", source_id)
+    if not volume:
+        return None
+
+    volume_match = VOLUME_RE.search(volume)
+    if not volume_match:
+        return None
+
+    return {
+        "id": source_id,
+        "muted": "[MUTED]" in volume,
+        "volume": float(volume_match.group(1)),
+    }
+
+
+def wpctl_source_infos(status):
+    source_ids = wpctl_source_ids_from_status(status or "")
+
+    if not source_ids:
+        default_source = wpctl_source_info(WPCTL_DEFAULT_SOURCE)
+        return [default_source] if default_source else []
+
+    infos = []
+    for source_id in source_ids:
+        info = wpctl_source_info(source_id)
+        if info:
+            infos.append(info)
+
+    return infos
+
+
+def wpctl_mic_state():
+    status = run_wpctl("status") or ""
+    sources = wpctl_source_infos(status)
+    return source_state(sources)
+
+
+def wpctl_toggle_sources_mute():
+    status = run_wpctl("status") or ""
+    sources = wpctl_source_infos(status)
+
+    if not sources:
+        run_wpctl("set-mute", WPCTL_DEFAULT_SOURCE, "toggle")
+        return
+
+    mute_sources = any(not source["muted"] for source in sources)
+    mute_value = "1" if mute_sources else "0"
+
+    for source in sources:
+        run_wpctl("set-mute", source["id"], mute_value)
+
+
+# Tray updates
+
+def mic_state():
+    return pactl_mic_state() or wpctl_mic_state()
+
+
+def toggle_sources_mute():
+    if not pactl_toggle_sources_mute():
+        wpctl_toggle_sources_mute()
 
 
 tray = Tray()
-bus = SessionBus()
-
-bus.publish(BUS_NAME, (OBJ_PATH, tray))
-
-watcher = bus.get(
-    "org.kde.StatusNotifierWatcher",
-    "/StatusNotifierWatcher"
-)
-
-watcher.RegisterStatusNotifierItem(BUS_NAME)
-
-
-def mic_state():
-    volume = subprocess.run(
-        ["wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@"],
-        capture_output=True,
-        text=True
-    ).stdout
-
-    if "[MUTED]" in volume:
-        return "muted"
-
-    volume_v = float(volume.strip().split()[-1])
-
-    status = subprocess.run(
-        ["wpctl", "status"],
-        capture_output=True,
-        text=True
-    ).stdout
-
-    if "Audio/Source" in status:
-
-        if abs(volume_v) < 1e-9:
-            return "low"
-
-        return "active"
-
-
-    return "idle"
-
-
 current_icon = None
 
 
 def update():
-
     global current_icon
 
     state_icon = {
-        "active": "microphone-sensitivity-high",
-        "low": "microphone-sensitivity-low",
+        "unmuted": "microphone-sensitivity-high",
+        "zero-volume": "microphone-sensitivity-medium",
         "muted": "microphone-sensitivity-muted",
+        "unavailable": "microphone-sensitivity-medium",
     }
 
     state = mic_state()
-
-    icon = state_icon.get(
-        state,
-        "microphone-sensitivity-medium"
-        )
-
+    icon = state_icon[state]
 
     if icon != current_icon:
         tray.IconName = icon
@@ -119,5 +365,20 @@ def update():
     return True
 
 
-GLib.timeout_add(500, update)
-GLib.MainLoop().run()
+def main():
+    bus = SessionBus()
+    bus.publish(BUS_NAME, (OBJ_PATH, tray))
+
+    watcher = bus.get(
+        "org.kde.StatusNotifierWatcher",
+        "/StatusNotifierWatcher",
+    )
+    watcher.RegisterStatusNotifierItem(BUS_NAME)
+
+    update()
+    GLib.timeout_add(500, update)
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()
