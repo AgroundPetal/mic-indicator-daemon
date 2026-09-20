@@ -8,6 +8,22 @@ Unlike many existing solutions, it **does not open or capture the microphone str
 
 ---
 
+## Before you install: check the built-in indicator first
+
+KDE Plasma already has a microphone tray icon, but by default it only 
+appears **while an application is actively recording**, so it is easy to 
+miss and assume it does not exist. You can make it **permanent** without
+this daemon:
+
+1. Right-click the system tray → **Configure System Tray…**
+2. Open the **Entries** tab.
+3. Find the **Microphone** entry and set its visibility to **Always shown**
+   (instead of *Shown when relevant*).
+
+If that gives you the persistent icon you want, you do not need this project.
+
+---
+
 ## Features
 
 * Permanent **tray microphone icon**
@@ -54,6 +70,12 @@ Install dependencies on Ubuntu / Ubuntu Studio:
 sudo apt install python3-pydbus python3-gi pulseaudio-utils
 ```
 
+Install dependencies on Fedora:
+
+```bash
+sudo dnf install python3-pydbus python3-gobject pulseaudio-utils
+```
+
 ---
 
 ## Installation
@@ -73,6 +95,18 @@ Install and restart the daemon immediately:
 ```
 
 You should see a **microphone icon in the Plasma tray**. On future Plasma logins, the autostart entry launches it automatically.
+
+### Managing the daemon
+
+```bash
+./install.sh --start       # start it now
+./install.sh --stop        # stop it
+./install.sh --restart     # reinstall, then stop and start
+./install.sh --status      # is it running? is autostart set?
+./install.sh --enable      # recreate the autostart entry and start it
+./install.sh --disable     # stop it and remove autostart (keeps the binary)
+./install.sh --uninstall   # stop it and remove the binary and autostart entry
+```
 
 ---
 

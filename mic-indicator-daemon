@@ -51,7 +51,10 @@ class Tray:
     NewIcon = signal()
 
     def Activate(self, x, y):
-        toggle_sources_mute()
+        try:
+            toggle_sources_mute()
+        except Exception:
+            pass
         update()
 
 
@@ -330,6 +333,8 @@ def wpctl_toggle_sources_mute():
 # Tray updates
 
 def mic_state():
+    # pactl_mic_state() returns None only when pactl is unavailable, so a real
+    # answer ("unavailable", "muted", ...) is used as-is and wpctl is the fallback.
     return pactl_mic_state() or wpctl_mic_state()
 
 
@@ -352,15 +357,20 @@ def update():
         "unavailable": "microphone-sensitivity-medium",
     }
 
-    state = mic_state()
-    icon = state_icon[state]
+    # Swallow transient errors so a single failed poll leaves a stale icon for
+    # one tick instead of killing the timer (returning True keeps it scheduled).
+    try:
+        state = mic_state()
+        icon = state_icon.get(state, state_icon["unavailable"])
 
-    if icon != current_icon:
-        tray.IconName = icon
-        tray.NewIcon()
-        current_icon = icon
+        if icon != current_icon:
+            tray.IconName = icon
+            tray.NewIcon()
+            current_icon = icon
 
-    tray.ToolTip = ("", [], "Microphone", state)
+        tray.ToolTip = ("", [], "Microphone", state or "unavailable")
+    except Exception:
+        pass
 
     return True
 
